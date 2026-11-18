@@ -39,7 +39,7 @@ from .const import (
 	LOGGER_NAME,
 	WEBSITES_REFRESH,
 )
-from .exceptions import FamilyLinkException, SessionExpiredError
+from .exceptions import FamilyLinkException, NetworkError, SessionExpiredError
 from .schedules import morning_window_from_yesterday
 from .strict_mode import (
 	ACTION_CANCEL_BONUS,
@@ -53,6 +53,8 @@ from .strict_mode import (
 	ACTION_UNLOCK_DEVICE,
 	DEVICE_INTENT_AUTO_LOCK,
 	plan_strict_actions,
+	plan_unverified_locks,
+	unverified_devices,
 	snapshot_policies,
 	snapshot_values,
 )
@@ -107,6 +109,24 @@ def _strict_key(action: dict[str, Any]) -> str:
 
 class FamilyLinkDataUpdateCoordinator(DataUpdateCoordinator):
 	"""Class to manage fetching data from the Family Link API."""
+
+	_fail_logged: dict[str, float] | None = None  # failed read -> when it was last warned about
+
+	def _fetch_failed(self, message: str, err: Exception) -> None:
+		"""Warn about a failed read at most every 15 minutes, then log it at debug.
+
+		Google answers 503 in waves and every read is retried at the next refresh:
+		one warning per wave tells the story, the same line each minute buries the
+		log.
+		"""
+		if self._fail_logged is None:
+			self._fail_logged = {}
+		now = time.monotonic()
+		last = self._fail_logged.get(message)
+		quiet = last is not None and now - last < 900
+		if not quiet:
+			self._fail_logged[message] = now
+		_LOGGER.log(logging.DEBUG if quiet else logging.WARNING, "%s: %s", message, err)
 
 	def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
 		"""Initialize the coordinator."""
@@ -218,7 +238,10 @@ class FamilyLinkDataUpdateCoordinator(DataUpdateCoordinator):
 				self._is_retrying_auth = False  # Always reset flag
 
 		except FamilyLinkException as err:
-			_LOGGER.error("Error fetching Family Link data: %s", err)
+			if isinstance(err, NetworkError):
+				self._fetch_failed("Error fetching Family Link data", err)
+			else:
+				_LOGGER.error("Error fetching Family Link data: %s", err)
 			if (cached := self._recent_data()) is not None:
 				_LOGGER.info("Returning last known data due to FamilyLinkException: %s", err)
 				return cached
@@ -311,7 +334,7 @@ class FamilyLinkDataUpdateCoordinator(DataUpdateCoordinator):
 			except SessionExpiredError:
 				raise  # Re-raise to trigger auth notification
 			except Exception as err:
-				_LOGGER.warning(f"Failed to fetch apps and usage data for {child_name}: {err}")
+				self._fetch_failed(f"Failed to fetch apps and usage data for {child_name}", err)
 				# Try to recover apps_usage_data from last known data cache.
 				# Note: deviceInfo is intentionally left out here — the cached
 				# child stores already-parsed `devices`, not raw deviceInfo, so
@@ -403,7 +426,7 @@ class FamilyLinkDataUpdateCoordinator(DataUpdateCoordinator):
 			except SessionExpiredError:
 				raise  # Re-raise to trigger auth notification
 			except Exception as err:
-				_LOGGER.warning(f"Failed to fetch time limit config for {child_name}: {err}")
+				self._fetch_failed(f"Failed to fetch time limit config for {child_name}", err)
 				time_limit_fresh = False
 				# Try to recover from last known data cache
 				if self._last_known_data:
@@ -430,14 +453,17 @@ class FamilyLinkDataUpdateCoordinator(DataUpdateCoordinator):
 			# Google actually applies on the child device right now (issue #114).
 			bedtime_enabled_today = None
 			schooltime_enabled_today = None
+			missing_devices = unverified_devices(devices, {}, bool(daily_limit_switch))
 			applied_limits_fresh = True
 
 			try:
-				applied_limits_data = await self.client.async_get_applied_time_limits(
-					account_id=child_id,
+				applied_limits_data = await self._async_read_verified_limits(
+					devices, bool(daily_limit_switch), account_id=child_id,
 					bedtime_rule_id=bedtime_rule_id,
 					schooltime_rule_id=schooltime_rule_id,
 				)
+				missing_devices = unverified_devices(devices, applied_limits_data, bool(daily_limit_switch))
+				applied_limits_fresh = not missing_devices
 				device_lock_states = applied_limits_data.get("device_lock_states", {})
 				devices_time_data = applied_limits_data.get("devices", {})
 				bedtime_enabled_today = applied_limits_data.get("bedtime_enabled_today")
@@ -451,7 +477,7 @@ class FamilyLinkDataUpdateCoordinator(DataUpdateCoordinator):
 			except SessionExpiredError:
 				raise  # Re-raise to trigger auth notification
 			except Exception as err:
-				_LOGGER.warning(f"Failed to fetch applied time limits for {child_name}: {err}")
+				self._fetch_failed(f"Failed to fetch applied time limits for {child_name}", err)
 				applied_limits_fresh = False
 				# Try to recover from last known data cache
 				if self._last_known_data:
@@ -583,7 +609,7 @@ class FamilyLinkDataUpdateCoordinator(DataUpdateCoordinator):
 			except SessionExpiredError:
 				raise  # Re-raise to trigger auth notification
 			except Exception as err:
-				_LOGGER.warning(f"Failed to fetch screen time data for {child_name}: {err}")
+				self._fetch_failed(f"Failed to fetch screen time data for {child_name}", err)
 				# Try to recover from last known data cache
 				if self._last_known_data:
 					for cached_child in self._last_known_data.get("children_data", []):
@@ -612,7 +638,7 @@ class FamilyLinkDataUpdateCoordinator(DataUpdateCoordinator):
 				except SessionExpiredError:
 					raise  # Re-raise to trigger auth notification
 				except Exception as err:
-					_LOGGER.warning(f"Failed to fetch location data for {child_name}: {err}")
+					self._fetch_failed(f"Failed to fetch location data for {child_name}", err)
 					# Keep the last position: a cleared one sends the tracker to
 					# unknown and fires zone automations on a Google hiccup
 					for cached_child in (self._last_known_data or {}).get("children_data", []):
@@ -628,7 +654,7 @@ class FamilyLinkDataUpdateCoordinator(DataUpdateCoordinator):
 			except SessionExpiredError:
 				raise  # Re-raise to trigger auth notification
 			except Exception as err:
-				_LOGGER.warning(f"Failed to fetch contact restriction for {child_name}: {err}")
+				self._fetch_failed(f"Failed to fetch contact restriction for {child_name}", err)
 				if self._last_known_data:
 					for cached_child in self._last_known_data.get("children_data", []):
 						if cached_child.get("child_id") == child_id:
@@ -644,7 +670,7 @@ class FamilyLinkDataUpdateCoordinator(DataUpdateCoordinator):
 			except SessionExpiredError:
 				raise  # Re-raise to trigger auth notification
 			except Exception as err:
-				_LOGGER.warning(f"Failed to fetch device batteries for {child_name}: {err}")
+				self._fetch_failed(f"Failed to fetch device batteries for {child_name}", err)
 				for cached_child in (self._last_known_data or {}).get("children_data", []):
 					if cached_child.get("child_id") == child_id:
 						device_batteries = cached_child.get("device_batteries", {})
@@ -661,6 +687,7 @@ class FamilyLinkDataUpdateCoordinator(DataUpdateCoordinator):
 				"devices": devices,
 				"time_limit_fresh": time_limit_fresh,
 				"applied_limits_fresh": applied_limits_fresh,
+				"unverified_devices": missing_devices,
 				"screen_time": screen_time,
 				"location": location,
 				"contact_restriction": contact_restriction,
@@ -1216,6 +1243,25 @@ class FamilyLinkDataUpdateCoordinator(DataUpdateCoordinator):
 		if enabled and enforce_now and self.data:
 			self.hass.async_create_task(self._async_enforce_strict_mode(self.data))
 
+	async def _async_read_verified_limits(self, devices: list[dict[str, Any]], daily_enabled: bool, **kwargs: Any) -> dict[str, Any]:
+		"""Retry missing/failed device reads independently of the normal poll."""
+		for attempt in range(3):
+			try:
+				result = await self.client.async_get_applied_time_limits(**kwargs)
+				missing = unverified_devices(devices, result, daily_enabled)
+				if not missing:
+					return result
+				_LOGGER.warning("GET appliedTimeLimits incomplete: missing=%s attempt=%s/3", missing, attempt + 1)
+				if attempt == 2:
+					return result
+			except SessionExpiredError:
+				raise
+			except Exception:
+				if attempt == 2:
+					raise
+			await asyncio.sleep(2)
+		return {}
+
 	async def _async_enforce_strict_mode(self, data: dict[str, Any] | None) -> None:
 		"""Revert restriction changes made from the Family Link side (strict mode).
 
@@ -1228,11 +1274,16 @@ class FamilyLinkDataUpdateCoordinator(DataUpdateCoordinator):
 			child_id = child_data.get("child_id")
 			if not child_id or not self.is_strict_mode_enabled(child_id):
 				continue
-			if child_data.get("time_limit_fresh") is False or child_data.get("applied_limits_fresh") is False:
-				# A refresh that could not read the rules or the applied limits:
-				# neither a reference to take from Google nor anything to correct
-				_LOGGER.debug(f"Strict mode: refresh incomplete for {child_id}, evaluation skipped")
+			if child_data.get("time_limit_fresh") is False or child_data.get("applied_limits_fresh") is False or child_data.get("unverified_devices"):
+				_LOGGER.warning("Strict mode: UNVERIFIED for %s; missing devices=%s; retrying next poll",
+					child_data.get("child_name", child_id), child_data.get("unverified_devices", []))
+				self.strict_mode_status.setdefault(child_id, {"actions_count": 0})["verified"] = False
+				intents = self._intents_for(child_id)
+				planned = copy.deepcopy(intents)
+				for action in plan_unverified_locks(child_data, self.strict_rules, intents, self._ha_bonus_devices()):
+					await self._async_run_strict_action(child_data, action, planned)
 				continue
+			self.strict_mode_status.setdefault(child_id, {"actions_count": 0})["verified"] = True
 			try:
 				intents = self._intents_for(child_id)
 				added = snapshot_policies(child_data, self.strict_rules, intents)
@@ -1316,7 +1367,7 @@ class FamilyLinkDataUpdateCoordinator(DataUpdateCoordinator):
 		# Three normal attempts, then progressively slower retries, capped at
 		# fifteen minutes. A persistent bypass must never exhaust enforcement.
 		retry_delay = min(900, STRICT_MODE_COOLDOWN * 2 ** min(4, max(0, attempts - 2)))
-		if name in (ACTION_SET_BEDTIME, ACTION_ENABLE_BEDTIME, ACTION_SET_DAILY_LIMIT, ACTION_SET_WEEKLY_LIMIT, ACTION_ENABLE_DAILY_LIMIT):
+		if action.get("unverified") or name in (ACTION_SET_BEDTIME, ACTION_ENABLE_BEDTIME, ACTION_SET_DAILY_LIMIT, ACTION_SET_WEEKLY_LIMIT, ACTION_ENABLE_DAILY_LIMIT):
 			retry_delay = 60
 		if now - self._strict_cooldown.get(key, 0.0) < retry_delay:
 			_LOGGER.debug(f"Strict mode: {name} for {child_id}/{device_id} skipped, cooldown active")

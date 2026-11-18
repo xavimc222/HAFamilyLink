@@ -45,6 +45,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from .const import CAPS_TIME_LIMIT
+
 STRICT_RULE_BONUS = "bonus"
 STRICT_RULE_LOCK = "lock"
 STRICT_RULE_BEDTIME = "bedtime"
@@ -90,6 +92,12 @@ _POLICY_ACTIONS = {
 	STRICT_RULE_DAILY_LIMIT: (ACTION_ENABLE_DAILY_LIMIT, "daily limit"),
 	STRICT_RULE_SCHOOL_TIME: (ACTION_ENABLE_SCHOOL_TIME, "school time"),
 }
+
+
+def _takes_time_limits(device: dict[str, Any]) -> bool:
+	"""A phone, tablet or Chromebook: a Google TV has no applied limits and no lock."""
+	caps = device.get("capabilities")
+	return not caps or any(cap in caps for cap in CAPS_TIME_LIMIT)
 
 
 def device_is_usable(device: dict[str, Any], time_data: dict[str, Any] | None) -> bool:
@@ -182,6 +190,28 @@ def _plan_device_lock(
 	return []
 
 
+def unverified_devices(devices: list[dict[str, Any]], applied: dict[str, Any], daily_enabled: bool = False) -> list[str]:
+	"""HTTP success alone does not prove that a device's restrictions were read."""
+	rows = applied.get("devices") or {}
+	return [device["id"] for device in devices if device.get("id") and _takes_time_limits(device) and (
+		not rows.get(device["id"])
+		or rows[device["id"]].get("bonus_minutes") is None
+		or (daily_enabled and rows[device["id"]].get("daily_limit_enabled") is None)
+	)]
+
+
+def plan_unverified_locks(child_data: dict[str, Any], rules: set[str], intents: dict[str, Any], ha_bonus_devices: set[str]) -> list[dict[str, Any]]:
+	"""Protect unreadable devices without replacing an explicit parent decision."""
+	if STRICT_RULE_LOCK not in rules:
+		return []
+	missing = child_data.get("unverified_devices", [])
+	return [{"action": ACTION_LOCK_DEVICE, "child_id": child_data["child_id"],
+		"device_id": device_id, "reason": "device restrictions unverifiable after retries; protective lock",
+		"record": "lock" if (intents.get("devices") or {}).get(device_id) == "lock" else DEVICE_INTENT_AUTO_LOCK, "unverified": True}
+		for device_id in missing if device_id not in ha_bonus_devices
+		and (intents.get("devices") or {}).get(device_id) != "unlock"]
+
+
 def plan_strict_actions(
 	child_data: dict[str, Any],
 	rules: set[str] | frozenset[str],
@@ -238,6 +268,26 @@ def plan_strict_actions(
 				child_id, device, time_data, device_intents.get(device_id),
 				ha_bonus=device_id in ha_bonus_devices,
 			))
+		elif (
+			STRICT_RULE_LOCK in rules
+			and device_intents.get(device_id) == "lock"
+			and device_id not in ha_bonus_devices
+			and not device.get("locked", False)
+			and _takes_time_limits(device)
+		):
+			# Google answered, but without this device: its lock and its
+			# restrictions are no longer applied (2026-11-17: both devices gone
+			# from the applied limits at 22:05, phone used until 01:33, and the
+			# lock decided from Home Assistant at 21:33 was never put back).
+			# Only the lock decided from Home Assistant is put back: without a
+			# row there is nothing to tell a restriction is over, so no lock of
+			# strict mode's own is placed or lifted here.
+			actions.append({
+				"action": ACTION_LOCK_DEVICE,
+				"child_id": child_id,
+				"device_id": device_id,
+				"reason": "no longer listed in Google's applied limits while locked from Home Assistant",
+			})
 
 	restored: set[str] = set()
 	for policy in POLICY_RULES:
