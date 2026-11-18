@@ -1,0 +1,5 @@
+FROM ghcr.io/home-assistant/home-assistant@sha256:6785d1eca68747a524c156faae1b139ed415c07357386ae6fe17291986e59e82
+# Install the image's version before Home Assistant starts; /config is persistent.
+COPY custom_components/familylink /opt/familylink
+RUN python -m compileall -q /opt/familylink
+ENTRYPOINT ["sh", "-c", "mkdir -p /config/custom_components && rm -rf /config/custom_components/familylink && cp -a /opt/familylink /config/custom_components/familylink && exec /init"]

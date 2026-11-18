@@ -2133,7 +2133,7 @@ class FamilyLinkClient:
 					f"Time bonus delete response for override {override_id}: "
 					f"{response_text[:300]}"
 				)
-				_LOGGER.info(f"Successfully cancelled time bonus override {override_id}")
+				_LOGGER.info("POST timeLimitOverride DELETE: HTTP 200 accepted; applied state not yet verified")
 				return True
 
 		except Exception as err:
@@ -2456,7 +2456,7 @@ class FamilyLinkClient:
 			payload = json.dumps([
 				None,
 				account_id,
-				[None, [[2 if limit_on else 1, None, None, [[slot, int(daily_minutes)]]]]],
+				[None, [[2 if limit_on else 1, None, [[slot, 2]] if limit_on else None, [[slot, int(daily_minutes)]]]]],
 				None,
 				[1],
 			])
@@ -3100,9 +3100,8 @@ class FamilyLinkClient:
 		Same approach as the time bonus verification (#141): batchCreate
 		answers HTTP 200 whether or not the override takes effect, so the
 		applied value is polled twice (after 3s, then after 5 more). Returns
-		True when the expected minutes are visible, or when the verification
-		itself errored (an unknown state must not be reported as a failure),
-		False when the value is confirmed unchanged.
+		True only when the expected minutes and enabled state are visible.
+		Missing data and verification errors are not verified success.
 		"""
 		observed: list[Any] = []
 		try:
@@ -3114,7 +3113,7 @@ class FamilyLinkClient:
 				listed = listed or device_id in devices
 				actual = devices.get(device_id, {}).get("daily_limit_minutes")
 				observed.append(actual)
-				if actual == expected_minutes:
+				if actual == expected_minutes and devices.get(device_id, {}).get("daily_limit_enabled") is True:
 					_LOGGER.info(
 						f"Daily limit verified for device {device_id}: {actual} minutes "
 						f"visible in applied time limits"
@@ -3139,8 +3138,8 @@ class FamilyLinkClient:
 			)
 			return False
 		except Exception as err:
-			_LOGGER.debug(f"Could not verify daily limit application: {err}")
-			return True
+			_LOGGER.warning(f"Could not verify daily limit application: {err}")
+			return False
 
 	# Slot-id protobuf field 1 ("rule type"): 1 = bedtime, 3 = school time.
 	_SLOT_TYPE_BEDTIME = 1
@@ -3425,7 +3424,7 @@ class FamilyLinkClient:
 					None,
 					account_id,
 					[
-						[None, None, None, [[day_code, [start_hour, start_min], [end_hour, end_min]]]],
+						[None, None, [[day_code, 2]], [[day_code, [start_hour, start_min], [end_hour, end_min]]]],
 						None, None, None, [],
 					],
 					None,
@@ -3454,11 +3453,19 @@ class FamilyLinkClient:
 							response.status, response_text,
 						)
 						return False
-					_LOGGER.info(
-						"Successfully set weekly bedtime %s-%s for day %s",
-						start_time, end_time, day,
-					)
-					return True
+				self._weekly_slot_cache.pop(account_id, None)
+				observed = await self.async_get_time_limit(account_id)
+				verified = any(
+					slot.get("day") == day and slot.get("enabled") is True
+					and slot.get("start") == [start_hour, start_min]
+					and slot.get("end") == [end_hour, end_min]
+					for slot in observed.get("bedtime_schedule", [])
+				)
+				_LOGGER.info(
+					"POST weekly bedtime accepted; GET day=%s enabled hours=%s-%s verified=%s",
+					day, start_time, end_time, verified,
+				)
+				return verified
 
 			# scope == "today": one-off per-day override ("Ce soir seulement").
 			# Type 9 = bedtime override, action 2 = enabled.
@@ -4264,7 +4271,10 @@ class FamilyLinkClient:
 				# item[1] (epoch ms string) — NOT the last in iteration order.
 				# Picking by list position silently read a stale override and
 				# made the switch ignore a fresh "Only today" toggle.
-				bedtime_enabled_today = bedtime_enabled
+				today_slots = [slot for slot in bedtime_schedule if slot.get("day") == dt_util.now().isoweekday()]
+				bedtime_enabled_today = bedtime_enabled and (
+					any(slot.get("enabled") for slot in today_slots) if today_slots else True
+				)
 				today_day_code = self._DAY_CODES.get(dt_util.now().isoweekday())
 				# Google keeps the overrides of earlier weeks under the same day:
 				# only one posted today speaks for today (as for school time, #231)

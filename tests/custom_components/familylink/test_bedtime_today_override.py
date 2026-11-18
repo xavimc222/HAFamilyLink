@@ -85,3 +85,30 @@ async def test_only_an_override_posted_today_counts(posted, expected) -> None:
 
     assert result["bedtime_enabled"] is True
     assert result["bedtime_enabled_today"] is expected
+
+
+async def test_disabled_weekday_is_not_enabled_by_global_toggle() -> None:
+    data = _time_limit_data()
+    data[0][1][0][1] = dt_util.now().isoweekday()
+    data[0][1][0][2] = 1
+    client = _client(_Response([[None, '1'], data]))
+    result = await client.async_get_time_limit(account_id=CHILD_ID)
+    assert result['bedtime_enabled'] is True
+    assert result['bedtime_enabled_today'] is False
+
+
+@pytest.mark.parametrize('enabled,expected', [(False, False), (True, True)])
+async def test_weekly_bedtime_requires_enabled_readback(enabled, expected) -> None:
+    import json
+    client = _client(_Response([]))
+    client._weekly_slot_cache = {}
+    client._async_get_weekly_bedtime_slot_id = AsyncMock(return_value='slot-1')
+    client.async_get_time_limit = AsyncMock(return_value={'bedtime_schedule': [
+        {'day': 1, 'enabled': enabled, 'start': [22, 0], 'end': [7, 30]},
+    ]})
+    session = await client._get_session()
+    session.post.return_value = _Response([])
+    assert await client.async_set_bedtime('22:00', '07:30', day=1, account_id=CHILD_ID) is expected
+    payload = json.loads(session.post.call_args.kwargs['data'])
+    assert payload[2][0][2] == [['slot-1', 2]]
+    assert payload[2][0][3] == [['slot-1', [22, 0], [7, 30]]]

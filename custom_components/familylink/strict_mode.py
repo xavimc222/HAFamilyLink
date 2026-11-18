@@ -431,9 +431,10 @@ def _plan_values(
 		# The weekly quotas (the app's weekly screen) are put back day by day
 		# with the weekly write; unknown days are skipped.
 		observed = observed_daily_limits(child_data)
+		disabled_days = {str(row.get("day")) for row in child_data.get("daily_limit_week", []) if row.get("enabled") is False}
 		for day, minutes in sorted(reference_limits.items()):
 			observed_minutes = observed.get(day)
-			if observed_minutes is None or observed_minutes == minutes:
+			if observed_minutes is None or (observed_minutes == minutes and (day not in disabled_days or minutes == 0)):
 				continue
 			actions.append({
 				"action": ACTION_SET_WEEKLY_LIMIT,
@@ -452,11 +453,11 @@ def _plan_values(
 		# Limit off: the daily_limit policy rule owns it.
 		devices_time_data = child_data.get("devices_time_data") or {}
 		for device_id, time_data in devices_time_data.items():
-			if not isinstance(time_data, dict) or not time_data.get("daily_limit_enabled"):
+			if not isinstance(time_data, dict) or time_data.get("daily_limit_enabled") is None:
 				continue
 			reference_today = device_limits.get(device_id, reference_child)
 			applied = time_data.get("daily_limit_minutes")
-			if reference_today is None or type(applied) is not int or applied == reference_today:
+			if reference_today is None or (time_data.get("daily_limit_enabled") is not False and (type(applied) is not int or applied == reference_today)):
 				continue
 			actions.append({
 				"action": ACTION_SET_DAILY_LIMIT,

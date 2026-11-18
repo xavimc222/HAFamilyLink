@@ -1,0 +1,7 @@
+*
+!custom_components/
+!custom_components/familylink/
+!custom_components/familylink/**
+!Dockerfile.homeassistant
+**/__pycache__
+**/*.pyc

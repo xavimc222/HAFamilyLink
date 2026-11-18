@@ -1267,6 +1267,10 @@ class FamilyLinkDataUpdateCoordinator(DataUpdateCoordinator):
 			self._strict_cooldown = {k: t for k, t in self._strict_cooldown.items() if k.endswith(today_key)}
 			for action in actions:
 				await self._async_run_strict_action(child_data, action, planned)
+			_LOGGER.info(
+				"Strict mode: fresh check for %s; planned corrections=%s",
+				child_data.get("child_name", child_id), len(actions),
+			)
 
 	async def _async_run_strict_action(
 		self, child_data: dict[str, Any], action: dict[str, Any], planned: dict[str, Any] | None = None
@@ -1308,21 +1312,21 @@ class FamilyLinkDataUpdateCoordinator(DataUpdateCoordinator):
 
 		key = _strict_key(action)
 		now = time.time()
-		if now - self._strict_cooldown.get(key, 0.0) < STRICT_MODE_COOLDOWN:
+		attempts = self._strict_attempts.get(key, 0)
+		# Three normal attempts, then progressively slower retries, capped at
+		# fifteen minutes. A persistent bypass must never exhaust enforcement.
+		retry_delay = min(900, STRICT_MODE_COOLDOWN * 2 ** min(4, max(0, attempts - 2)))
+		if name in (ACTION_SET_BEDTIME, ACTION_ENABLE_BEDTIME, ACTION_SET_DAILY_LIMIT, ACTION_SET_WEEKLY_LIMIT, ACTION_ENABLE_DAILY_LIMIT):
+			retry_delay = 60
+		if now - self._strict_cooldown.get(key, 0.0) < retry_delay:
 			_LOGGER.debug(f"Strict mode: {name} for {child_id}/{device_id} skipped, cooldown active")
 			return
-		# Google answers 200 to writes it does not apply: a correction still
-		# planned after a few tries is given up instead of looping all night
-		attempts = self._strict_attempts.get(key, 0)
-		if attempts >= STRICT_MODE_MAX_ATTEMPTS:
-			_LOGGER.debug(f"Strict mode: {name} for {child_id}/{device_id} given up, no effect after {attempts} tries")
-			return
 		self._strict_attempts[key] = attempts + 1
-		last_try = attempts + 1 == STRICT_MODE_MAX_ATTEMPTS
-		if last_try:
+		last_try = False
+		if attempts + 1 >= STRICT_MODE_MAX_ATTEMPTS:
 			_LOGGER.warning(
 				f"Strict mode: {name} for child {child_data.get('child_name', child_id)} had no effect "
-				f"after {STRICT_MODE_MAX_ATTEMPTS} tries, given up until the state changes ({action.get('reason')})"
+				f"on prior attempts; retry {attempts + 1}, backoff capped at 900 seconds ({action.get('reason')})"
 			)
 		self._strict_cooldown[key] = now
 
@@ -1336,6 +1340,21 @@ class FamilyLinkDataUpdateCoordinator(DataUpdateCoordinator):
 				success = await self.client.async_cancel_time_bonus(
 					override_id=action["override_id"], account_id=child_id
 				)
+				if success:
+					applied = await self.client.async_get_applied_time_limits(child_id)
+					observed = (applied.get("devices") or {}).get(device_id) or {}
+					# Missing data is inconclusive, not proof of cancellation.
+					success = (
+						observed.get("bonus_minutes") == 0
+						and observed.get("bonus_override_id") is None
+					)
+					_LOGGER.info(
+						"Strict mode: GET appliedTimeLimits after bonus DELETE: "
+						"verified=%s, bonus_minutes=%s, override=%s",
+						success, observed.get("bonus_minutes"),
+						"same" if observed.get("bonus_override_id") == action["override_id"]
+						else "replacement" if observed.get("bonus_override_id") else "absent",
+					)
 			elif name in (ACTION_LOCK_DEVICE, ACTION_UNLOCK_DEVICE):
 				# Direct client call: async_control_device() requests a refresh,
 				# which must not run from inside the refresh in progress. The
@@ -1375,6 +1394,7 @@ class FamilyLinkDataUpdateCoordinator(DataUpdateCoordinator):
 					self.set_pending_time_limit_state(child_id, policy, None)
 		except Exception as err:
 			_LOGGER.error(f"Strict mode: {name} failed for child {child_id}: {err}")
+			success = False
 
 		if not success:
 			_LOGGER.warning(f"Strict mode: {name} for child {child_id} was not applied, will retry after cooldown")
@@ -1415,8 +1435,7 @@ class FamilyLinkDataUpdateCoordinator(DataUpdateCoordinator):
 			"start": action.get("start"),
 			"end": action.get("end"),
 			"observed": action.get("observed"),
-			# Strict mode gives this correction up after this try (until the state
-			# changes or the next day): a lock bypassed again and again ends here
+			# Kept for event consumers; retries no longer permanently stop.
 			"last_try": last_try,
 		})
 

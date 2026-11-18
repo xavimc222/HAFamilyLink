@@ -60,7 +60,7 @@ async def test_readback_of_a_listed_device_keeps_the_157_message(caplog) -> None
 
 
 async def test_readback_of_an_applied_value_passes() -> None:
-    client = _client({"devices": {PHONE: {"daily_limit_minutes": 45}}})
+    client = _client({"devices": {PHONE: {"daily_limit_minutes": 45, "daily_limit_enabled": True}}})
 
     assert await client._async_verify_daily_limit_applied(CHILD_ID, PHONE, 45)
 
@@ -145,3 +145,14 @@ async def test_service_error_has_no_hint_for_a_device_the_coordinator_does_not_k
         )
 
     assert "yet" not in str(err.value)
+
+
+@pytest.mark.parametrize("enabled", [False, None])
+async def test_matching_minutes_without_enabled_limit_are_not_verified(enabled):
+    client = _client({"devices": {PHONE: {"daily_limit_minutes": 45, "daily_limit_enabled": enabled}}})
+    assert not await client._async_verify_daily_limit_applied(CHILD_ID, PHONE, 45)
+
+async def test_readback_error_is_not_success():
+    client = _client({})
+    client.async_get_applied_time_limits.side_effect = RuntimeError("unavailable")
+    assert not await client._async_verify_daily_limit_applied(CHILD_ID, PHONE, 45)

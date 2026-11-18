@@ -13,6 +13,8 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+
 from custom_components.familylink.coordinator import FamilyLinkDataUpdateCoordinator
 from custom_components.familylink.strict_mode import (
     ACTION_ENABLE_DAILY_LIMIT,
@@ -97,7 +99,7 @@ def test_a_quota_set_from_ha_switches_the_limit_reference_on() -> None:
     assert coordinator._intents_for(CHILD)["policies"]["daily_limit"] is True
 
 
-async def test_a_correction_without_effect_is_given_up_after_three_tries() -> None:
+async def test_a_correction_without_effect_continues_after_three_tries() -> None:
     coordinator = _coordinator()
     action = {"action": ACTION_ENABLE_DAILY_LIMIT, "child_id": CHILD, "reason": "off at Google"}
     child = {"child_id": CHILD, "child_name": "Kid", "devices": []}
@@ -106,11 +108,12 @@ async def test_a_correction_without_effect_is_given_up_after_three_tries() -> No
         coordinator._strict_cooldown.clear()
         coordinator._pending_time_limit_states.clear()
         await coordinator._async_run_strict_action(child, action)
-    assert coordinator.client.async_enable_daily_limit.await_count == 3
-    assert coordinator.hass.bus.async_fire.call_count == 3
+    assert coordinator.client.async_enable_daily_limit.await_count == 5
+    assert coordinator.hass.bus.async_fire.call_count == 5
+    assert coordinator.hass.bus.async_fire.call_args.args[1]["last_try"] is False
 
 
-async def test_a_correction_given_up_is_tried_again_the_next_day(monkeypatch) -> None:
+async def test_a_correction_is_tried_again_the_next_day(monkeypatch) -> None:
     from datetime import datetime
 
     from custom_components.familylink import coordinator as coordinator_module
@@ -124,7 +127,86 @@ async def test_a_correction_given_up_is_tried_again_the_next_day(monkeypatch) ->
             coordinator._strict_cooldown.clear()
             coordinator._pending_time_limit_states.clear()
             await coordinator._async_run_strict_action(child, action)
-    assert coordinator.client.async_enable_daily_limit.await_count == 6
+    assert coordinator.client.async_enable_daily_limit.await_count == 8
+
+
+async def test_retry_backoff_is_bounded_and_recovers(monkeypatch) -> None:
+    from custom_components.familylink import coordinator as module
+
+    coordinator = _coordinator()
+    action = {"action": ACTION_ENABLE_DAILY_LIMIT, "child_id": CHILD, "reason": "off"}
+    child = {"child_id": CHILD, "devices": []}
+    now = 10000
+    monkeypatch.setattr(module.time, "time", lambda: now)
+    for delay in (60, 60, 60, 60, 60, 60, 60):
+        await coordinator._async_run_strict_action(child, action)
+        count = coordinator.client.async_enable_daily_limit.await_count
+        coordinator._pending_time_limit_states.clear()
+        now += delay - 1
+        await coordinator._async_run_strict_action(child, action)
+        assert coordinator.client.async_enable_daily_limit.await_count == count
+        now += 1
+    await coordinator._async_run_strict_action(child, action)
+    assert coordinator.client.async_enable_daily_limit.await_count == 8
+
+
+@pytest.mark.parametrize("observed,expected", [
+    ({"bonus_minutes": 0, "bonus_override_id": None}, True),
+    ({"bonus_minutes": 30, "bonus_override_id": "o-1"}, False),
+    ({"bonus_minutes": 30, "bonus_override_id": "o-2"}, False),
+    ({"bonus_minutes": 0, "bonus_override_id": "o-1"}, False),
+    ({}, False),
+])
+async def test_bonus_success_requires_fresh_zero_bonus(observed, expected) -> None:
+    coordinator = _coordinator()
+    coordinator.client.async_cancel_time_bonus = AsyncMock(return_value=True)
+    coordinator.client.async_get_applied_time_limits = AsyncMock(
+        return_value={"devices": {DEVICE: observed}},
+    )
+    action = {"action": "cancel_bonus", "child_id": CHILD, "device_id": DEVICE,
+              "override_id": "o-1", "reason": "bonus"}
+    await coordinator._async_run_strict_action({"child_id": CHILD}, action)
+    assert coordinator.strict_mode_status[CHILD]["last_success"] is expected
+
+
+async def test_bonus_read_failure_is_not_success_and_new_grant_is_retried() -> None:
+    coordinator = _coordinator()
+    coordinator.client.async_cancel_time_bonus = AsyncMock(return_value=True)
+    coordinator.client.async_get_applied_time_limits = AsyncMock(side_effect=[
+        RuntimeError("read failed"),
+        {"devices": {DEVICE: {"bonus_minutes": 0, "bonus_override_id": None}}},
+    ])
+    action = {"action": "cancel_bonus", "child_id": CHILD, "device_id": DEVICE,
+              "override_id": "o-1", "reason": "bonus"}
+    await coordinator._async_run_strict_action({"child_id": CHILD}, action)
+    assert coordinator.strict_mode_status[CHILD]["last_success"] is False
+    await coordinator._async_run_strict_action({"child_id": CHILD}, {**action, "override_id": "o-2"})
+    assert coordinator.strict_mode_status[CHILD]["last_success"] is True
+    assert coordinator.client.async_cancel_time_bonus.await_count == 2
+
+
+async def test_delayed_bonus_removal_is_verified_on_a_later_retry() -> None:
+    coordinator = _coordinator()
+    coordinator.client.async_cancel_time_bonus = AsyncMock(return_value=True)
+    coordinator.client.async_get_applied_time_limits = AsyncMock(side_effect=[
+        {"devices": {DEVICE: {"bonus_minutes": 30, "bonus_override_id": "o-1"}}},
+        {"devices": {DEVICE: {"bonus_minutes": 0, "bonus_override_id": None}}},
+    ])
+    action = {"action": "cancel_bonus", "child_id": CHILD, "device_id": DEVICE,
+              "override_id": "o-1", "reason": "bonus"}
+    await coordinator._async_run_strict_action({"child_id": CHILD}, action)
+    assert coordinator.strict_mode_status[CHILD]["last_success"] is False
+    coordinator._strict_cooldown.clear()
+    await coordinator._async_run_strict_action({"child_id": CHILD}, action)
+    assert coordinator.strict_mode_status[CHILD]["last_success"] is True
+
+
+async def test_disabled_strict_mode_does_not_retry() -> None:
+    coordinator = _coordinator()
+    coordinator.is_strict_mode_enabled = MagicMock(return_value=False)
+    coordinator._async_run_strict_action = AsyncMock()
+    await coordinator._async_enforce_strict_mode({"children_data": [_child(False)]})
+    coordinator._async_run_strict_action.assert_not_awaited()
 
 
 def test_the_strict_mode_lock_stays_while_bedtime_is_put_back() -> None:
@@ -162,6 +244,9 @@ def test_a_quota_google_refused_puts_the_limit_reference_back() -> None:
 async def test_the_notification_names_who_created_the_bonus() -> None:
     coordinator = _coordinator()
     coordinator.client.async_cancel_time_bonus = AsyncMock(return_value=True)
+    coordinator.client.async_get_applied_time_limits = AsyncMock(return_value={
+        "devices": {DEVICE: {"bonus_minutes": 0, "bonus_override_id": None}},
+    })
     coordinator.data = {"family_members": [{"userId": "42", "profile": {"displayName": "Benoit Collin"}}]}
     child = {
         "child_id": CHILD, "child_name": "Kid", "devices": [{"id": DEVICE, "name": "Phone"}],
@@ -218,3 +303,24 @@ def test_a_quota_set_on_one_device_is_not_copied_to_the_others(monkeypatch) -> N
     coordinator.record_daily_limit_minutes(CHILD, 0, 1, device_id="tablet")
     monkeypatch.setattr(coordinator_module.dt_util, "now", lambda: datetime(2026, 11, 10, 9, 0))
     assert "device_limits" not in coordinator._intents_for(CHILD)["values"]
+
+
+def test_global_on_disabled_day_and_device_are_repaired():
+    child = _child(True, weekly_minutes=120)
+    child['daily_limit_week'] = [{'day': 1, 'weekly_minutes': 120, 'enabled': False}]
+    child['devices_time_data'][DEVICE] = {'daily_limit_enabled': False, 'daily_limit_minutes': None}
+    values = {'weekly_limits': {'1': 120}}
+    actions = _actions(child, {'daily_limit': True}, values)
+    assert 'set_weekly_limit' in actions
+    assert 'set_daily_limit' in actions
+    assert _actions(child, {'daily_limit': False}, values) == []
+
+
+def test_disabled_today_preserves_parent_exception():
+    child = _child(True)
+    child['devices_time_data'][DEVICE] = {'daily_limit_enabled': False}
+    intents = {'policies': {'daily_limit': True}, 'devices': {},
+               'values': {'weekly_limits': {'1': 120}, 'device_limits': {DEVICE: 150}}}
+    actions = plan_strict_actions(child, set(STRICT_RULES), frozenset(), intents, today=1)
+    correction = next(a for a in actions if a['action'] == 'set_daily_limit')
+    assert correction['minutes'] == 150
