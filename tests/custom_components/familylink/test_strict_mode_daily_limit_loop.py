@@ -36,6 +36,7 @@ def _coordinator() -> FamilyLinkDataUpdateCoordinator:
     coordinator.client.async_enable_daily_limit = AsyncMock(return_value=True)
     coordinator._pending_time_limit_states = {}
     coordinator._pending_lock_states = {}
+    coordinator._cancelled_overrides = {}
     coordinator._strict_cooldown = {}
     coordinator._strict_attempts = {}
     coordinator._ha_writes_running = {}
@@ -324,3 +325,17 @@ def test_disabled_today_preserves_parent_exception():
     actions = plan_strict_actions(child, set(STRICT_RULES), frozenset(), intents, today=1)
     correction = next(a for a in actions if a['action'] == 'set_daily_limit')
     assert correction['minutes'] == 150
+
+
+@pytest.mark.parametrize("second,relation", [("first", "same"), ("next", "replacement")])
+async def test_verified_bonus_recurrence(second, relation, caplog):
+    coordinator = _coordinator()
+    coordinator.client.async_cancel_time_bonus = AsyncMock(return_value=True)
+    coordinator.client.async_get_applied_time_limits = AsyncMock(return_value={
+        "devices": {DEVICE: {"bonus_minutes": 0, "bonus_override_id": None}}})
+    child = {"child_id": CHILD, "child_name": "Kid", "devices_time_data": {DEVICE: {"bonus_expiry_ms": 123}}}
+    action = {"action": "cancel_bonus", "child_id": CHILD, "device_id": DEVICE, "override_id": "first"}
+    await coordinator._async_run_strict_action(child, action)
+    coordinator._strict_cooldown.clear()
+    await coordinator._async_run_strict_action(child, dict(action, override_id=second))
+    assert f"after verified cancellation for Kid: {relation}, expiry_ms=123" in caplog.text

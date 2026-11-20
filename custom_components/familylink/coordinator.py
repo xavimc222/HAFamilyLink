@@ -41,6 +41,7 @@ from .const import (
 )
 from .exceptions import FamilyLinkException, NetworkError, SessionExpiredError
 from .schedules import morning_window_from_yesterday
+from .usage_watch import UsageWindow, observe_usage
 from .strict_mode import (
 	ACTION_CANCEL_BONUS,
 	ACTION_ENABLE_BEDTIME,
@@ -52,6 +53,8 @@ from .strict_mode import (
 	ACTION_SET_WEEKLY_LIMIT,
 	ACTION_UNLOCK_DEVICE,
 	DEVICE_INTENT_AUTO_LOCK,
+	device_is_usable,
+	restriction_active,
 	plan_strict_actions,
 	plan_unverified_locks,
 	unverified_devices,
@@ -140,6 +143,9 @@ class FamilyLinkDataUpdateCoordinator(DataUpdateCoordinator):
 		self._auth_notification_sent = False  # Only send auth notification once
 		self._pending_lock_states: dict[str, tuple[bool, float]] = {}  # device_id -> (locked, timestamp)
 		self._pending_time_limit_states: dict[str, dict[str, tuple[bool, float]]] = {}  # child_id -> {"bedtime": (enabled, timestamp), "school_time": (enabled, timestamp), "daily_limit": (enabled, timestamp)}
+		self._usage_windows: dict[tuple[str, str], UsageWindow] = {}
+		self._usage_locks_pending: set[tuple[str, str]] = set()
+		self._cancelled_overrides: dict[tuple[str, str], tuple[str, str]] = {}
 		self._last_known_data: dict[str, Any] | None = None  # Cache for last successful fetch
 		self._last_known_at: datetime | None = None  # when it was fetched (local time)
 		self.child_device_ids: dict[str, str] = {}  # child_id -> registry id of the child's hub device
@@ -202,10 +208,11 @@ class FamilyLinkDataUpdateCoordinator(DataUpdateCoordinator):
 				self._auth_notification_sent = False
 				_LOGGER.debug("Auth notification flag reset after successful data fetch")
 			self._last_known_data, self._last_known_at = result, dt_util.now()  # Store successful result
-			await self._async_enforce_strict_mode(result)
+			await self._enforce_after_poll(result)
 			return result
 
 		except SessionExpiredError as err:
+			self._usage_windows = {}
 			# Prevent infinite retry loops
 			if self._is_retrying_auth:
 				_LOGGER.error("Session still expired after refresh - cookies are invalid")
@@ -223,7 +230,7 @@ class FamilyLinkDataUpdateCoordinator(DataUpdateCoordinator):
 				result = await self._async_fetch_data()
 				self._is_retrying_auth = False  # Reset flag on success
 				self._last_known_data, self._last_known_at = result, dt_util.now()  # Store successful result
-				await self._async_enforce_strict_mode(result)
+				await self._enforce_after_poll(result)
 				return result
 
 			except SessionExpiredError:
@@ -238,6 +245,7 @@ class FamilyLinkDataUpdateCoordinator(DataUpdateCoordinator):
 				self._is_retrying_auth = False  # Always reset flag
 
 		except FamilyLinkException as err:
+			self._usage_windows = {}
 			if isinstance(err, NetworkError):
 				self._fetch_failed("Error fetching Family Link data", err)
 			else:
@@ -248,6 +256,7 @@ class FamilyLinkDataUpdateCoordinator(DataUpdateCoordinator):
 			raise UpdateFailed(f"Error communicating with Family Link: {err}") from err
 
 		except Exception as err:
+			self._usage_windows = {}
 			_LOGGER.exception("Unexpected error fetching Family Link data")
 			if (cached := self._recent_data()) is not None:
 				_LOGGER.info("Returning last known data due to unexpected error: %s", err)
@@ -323,9 +332,11 @@ class FamilyLinkDataUpdateCoordinator(DataUpdateCoordinator):
 
 			# Fetch complete apps and usage data for this child
 			apps_usage_data = None
+			usage_fresh = False
 			cached_devices = None  # Populated from cache only if the fetch fails
 			try:
 				apps_usage_data = await self.client.async_get_apps_and_usage(account_id=child_id)
+				usage_fresh = all(isinstance(apps_usage_data.get(k), list) for k in ("apps", "deviceInfo", "appUsageSessions"))
 				_LOGGER.debug(
 					f"Fetched for {child_name}: {len(apps_usage_data.get('apps', []))} apps, "
 					f"{len(apps_usage_data.get('deviceInfo', []))} devices, "
@@ -609,6 +620,7 @@ class FamilyLinkDataUpdateCoordinator(DataUpdateCoordinator):
 			except SessionExpiredError:
 				raise  # Re-raise to trigger auth notification
 			except Exception as err:
+				usage_fresh = False
 				self._fetch_failed(f"Failed to fetch screen time data for {child_name}", err)
 				# Try to recover from last known data cache
 				if self._last_known_data:
@@ -689,6 +701,8 @@ class FamilyLinkDataUpdateCoordinator(DataUpdateCoordinator):
 				"applied_limits_fresh": applied_limits_fresh,
 				"unverified_devices": missing_devices,
 				"screen_time": screen_time,
+				"usage_fresh": usage_fresh,
+				"reported_lock_states": device_lock_states if applied_limits_fresh else {},
 				"location": location,
 				"contact_restriction": contact_restriction,
 				"device_batteries": device_batteries,
@@ -1262,6 +1276,57 @@ class FamilyLinkDataUpdateCoordinator(DataUpdateCoordinator):
 			await asyncio.sleep(2)
 		return {}
 
+	async def _enforce_after_poll(self, result: dict[str, Any]) -> None:
+		try:
+			await self._observe_usage(result)
+		except Exception:
+			self._usage_windows = {}
+			_LOGGER.exception("Usage comparison unavailable for this poll")
+		await self._async_enforce_strict_mode(result)
+
+	async def _observe_usage(self, result: dict[str, Any]) -> None:
+		now = dt_util.now()
+		next_windows = {}
+		for child in result.get("children_data", []):
+			cid = child.get("child_id")
+			if not cid or not child.get("usage_fresh") or not self.is_strict_mode_enabled(cid):
+				continue
+			bonuses = self._ha_bonus_devices()
+			intents = self.strict_intents_today(cid)["devices"]
+			for device in child.get("devices", []):
+				did = device["id"]
+				key = (cid, did)
+				if key in self._usage_locks_pending and child.get("applied_limits_fresh") and did in child.get("reported_lock_states", {}):
+					confirmed = child["reported_lock_states"][did]
+					_LOGGER.info("Restricted usage lock readback for %s / %s: locked=%s",
+						child.get("child_name"), device.get("name"), confirmed)
+					self._usage_locks_pending.discard(key)
+				previous = self._usage_windows.get(key)
+				window, delta = observe_usage(
+					previous, child, did, self.strict_rules,
+					did in bonuses or intents.get(did) == "unlock", now,
+					2 * self.update_interval.total_seconds() + 10,
+				)
+				if window is None:
+					continue
+				next_windows[key] = window
+				child["usage_growth_reports"] = max(child.get("usage_growth_reports", 0), window.reports)
+				if window.reports >= 2:
+					child.setdefault("continued_usage_devices", []).append(did)
+				if not delta:
+					continue
+				label = f"{child.get('child_name')} / {device.get('name')}"
+				message = (f"{label}: usage reported during {window.restriction}; "
+					f"observations {previous.observed.isoformat()} to {now.isoformat()}; "
+					f"new seconds {delta}; cumulative seconds {window.growth}")
+				_LOGGER.warning("%s", message)
+				if window.reports == 2:
+					await self.hass.services.async_call("persistent_notification", "create", {
+						"title": "Family Link: continued restricted app usage",
+						"message": message, "notification_id": f"familylink_usage_{cid}_{did}_{window.day}",
+					})
+		self._usage_windows = next_windows
+
 	async def _async_enforce_strict_mode(self, data: dict[str, Any] | None) -> None:
 		"""Revert restriction changes made from the Family Link side (strict mode).
 
@@ -1319,8 +1384,9 @@ class FamilyLinkDataUpdateCoordinator(DataUpdateCoordinator):
 			for action in actions:
 				await self._async_run_strict_action(child_data, action, planned)
 			_LOGGER.info(
-				"Strict mode: fresh check for %s; planned corrections=%s",
-				child_data.get("child_name", child_id), len(actions),
+				"Strict mode: fresh check for %s; planned corrections=%s; usage fresh=%s, restricted growth reports=%s",
+				child_data.get("child_name", child_id), len(actions), child_data.get("usage_fresh", False),
+				child_data.get("usage_growth_reports", 0),
 			)
 
 	async def _async_run_strict_action(
@@ -1388,6 +1454,14 @@ class FamilyLinkDataUpdateCoordinator(DataUpdateCoordinator):
 		success = False
 		try:
 			if name == ACTION_CANCEL_BONUS:
+				bonus_key = (child_id, device_id)
+				day = dt_util.now().date().isoformat()
+				cancelled = self._cancelled_overrides.get(bonus_key)
+				if cancelled and cancelled[0] == day:
+					relation = "same" if cancelled[1] == action["override_id"] else "replacement"
+					row = (child_data.get("devices_time_data") or {}).get(device_id, {})
+					_LOGGER.warning("Bonus after verified cancellation for %s: %s, expiry_ms=%s",
+						child_data.get("child_name"), relation, row.get("bonus_expiry_ms"))
 				success = await self.client.async_cancel_time_bonus(
 					override_id=action["override_id"], account_id=child_id
 				)
@@ -1399,6 +1473,8 @@ class FamilyLinkDataUpdateCoordinator(DataUpdateCoordinator):
 						observed.get("bonus_minutes") == 0
 						and observed.get("bonus_override_id") is None
 					)
+					if success:
+						self._cancelled_overrides[bonus_key] = (day, action["override_id"])
 					_LOGGER.info(
 						"Strict mode: GET appliedTimeLimits after bonus DELETE: "
 						"verified=%s, bonus_minutes=%s, override=%s",
@@ -1411,8 +1487,19 @@ class FamilyLinkDataUpdateCoordinator(DataUpdateCoordinator):
 				# which must not run from inside the refresh in progress. The
 				# next poll picks the new state up; the pending state covers the UI.
 				google_action = DEVICE_LOCK_ACTION if name == ACTION_LOCK_DEVICE else DEVICE_UNLOCK_ACTION
+				if action.get("verify_usage_bypass"):
+					# An earlier action in this plan may already have deleted the bonus.
+					applied = await self.client.async_get_applied_time_limits(child_id)
+					row = applied.get("devices", {}).get(device_id, {})
+					locked = applied.get("device_lock_states", {}).get(device_id)
+					if (locked is not False or restriction_active(row) != action["restriction"]
+						or not device_is_usable({"locked": locked}, row)
+						or device_id in self._ha_bonus_devices() or self._ha_write_recent(device_id)):
+						return
 				success = await self.client.async_control_device(device_id, google_action, child_id)
 				if success:
+					if action.get("verify_usage_bypass"):
+						self._usage_locks_pending.add((child_id, device_id))
 					self._pending_lock_states[device_id] = (name == ACTION_LOCK_DEVICE, time.time())
 					if action.get("clear_intent"):
 						self.clear_device_intent(child_id, device_id)

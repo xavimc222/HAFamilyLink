@@ -2,6 +2,23 @@
 
 Author: Codex
 
+## Restricted usage reports — 2026-11-20
+
+The coordinator compares consecutive per-device app counters under daily-limit
+and bedtime restrictions. It logs the first growth report and raises a Home
+Assistant notification on continued growth. Missing or cached data, authorized
+exceptions and local day changes break the comparison. The lock planner uses
+an independent applied-limits read before acting on continued growth, and the
+next fresh device reading verifies an issued lock. Verified bonus cancellations
+are correlated with subsequent overrides during the same local day.
+
+Regression coverage includes late and duplicate reports, counter resets,
+authorized bonus and app exceptions, multiple devices, alert deduplication,
+and same versus replacement overrides. Detection starts with the first usage
+update Google reports. School-time usage is outside this comparison.
+
+## Earlier enforcement patches
+
 Base: `e4804751536146747be7c2b370ebdb7de310a90e`.
 Local image: `familylink-homeassistant:20261116.1`, Linux ARM64.
 

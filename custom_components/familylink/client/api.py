@@ -1635,6 +1635,7 @@ class FamilyLinkClient:
 									remaining_seconds = bonus_seconds
 									created = device_data[0][1]
 									if isinstance(created, str) and created.isdigit():
+										device_info["bonus_expiry_ms"] = int(created) + bonus_seconds * 1000
 										remaining_seconds = bonus_seconds - (time.time() * 1000 - int(created)) / 1000
 									device_info["bonus_minutes"] = max(0, -(-int(remaining_seconds) // 60))
 									_LOGGER.debug(

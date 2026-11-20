@@ -264,10 +264,20 @@ def plan_strict_actions(
 				})
 
 		if STRICT_RULE_LOCK in rules and time_data:
-			actions.extend(_plan_device_lock(
+			lock_actions = _plan_device_lock(
 				child_id, device, time_data, device_intents.get(device_id),
 				ha_bonus=device_id in ha_bonus_devices,
-			))
+			)
+			actions.extend(lock_actions)
+			active = restriction_active(time_data)
+			if (not lock_actions and not device_intents.get(device_id)
+				and device_id in child_data.get("continued_usage_devices", ())
+				and device_id not in ha_bonus_devices and active
+				and device_is_usable(device, time_data)):
+				actions.append({"action": ACTION_LOCK_DEVICE, "child_id": child_id,
+					"device_id": device_id, "record": DEVICE_INTENT_AUTO_LOCK,
+					"verify_usage_bypass": True, "restriction": active,
+					"reason": f"continued restricted app usage and device usable during {active}"})
 		elif (
 			STRICT_RULE_LOCK in rules
 			and device_intents.get(device_id) == "lock"
